@@ -1,0 +1,266 @@
+Goal: Build a reliable pipeline that ingests Amazon reviews, generates per-review summaries, computes model-based sentiment, and produces per-product narratives + metrics.
+
+Approach: Medallion flow → Processed (bronze) → Curated (silver) → Enriched (gold).
+
+Design choices:
+
+LLM for summaries (strength: paraphrase/context).
+
+Transformer for sentiment (strength: speed, determinism, cost).
+
+DuckDB for simple local warehousing; Airflow DAG for orchestration.
+
+File-by-file talking points
+src/config.py
+
+Centralizes all configurable knobs (LLM provider, models, rate limits, DuckDB path) with .env support.
+
+Encapsulated in a Settings dataclass → easier to inject/override in tests or different environments.
+
+Interviewer hook: “Why a config object?” → Keeps hardcoded values out of business logic and enables provider swaps (OpenAI/Gemini/HF) with zero code changes elsewhere.
+
+src/io_utils.py
+
+Creates the folder structure and opens a single DuckDB connection shared across modules.
+
+write_df() safely creates target tables using inferred DuckDB types, supports append/replace.
+
+Interviewer hook: “Why DuckDB?” → Fast, file-based, zero ops; can swap to Postgres/BigQuery later by replacing this module’s I/O.
+
+src/schemas.py
+
+Pydantic models document canonical shapes (review rows, per-review outputs, product aggregates).
+
+You can validate transforms or serialize samples for testing—adds clarity and guardrails.
+
+Interviewer hook: “Why Pydantic for a small project?” → Self-documenting contracts; easy future input validation.
+
+src/ingest_kaggle.py
+
+Ingests raw CSV → writes Parquet to data/processed/ and cleans columns:
+
+Renames to internal schema; casts rating; builds review_time_iso; computes helpful_ratio.
+
+Persists to DuckDB table bronze_reviews and also exports clean_reviews.csv for quick inspection.
+
+Interviewer hook: “Why Parquet and CSV?” → Parquet for efficient compute; CSV for reviewer convenience.
+
+src/preprocess.py
+
+Deduplication and optional sampling for cost control:
+
+Dedup key: (product_id, review_id, review_text) keep latest by review_time_iso.
+
+Writes silver_reviews as curated input to enrichment.
+
+Interviewer hook: “Why sample here?” → Token/cost control while preserving distribution; can be toggled off.
+
+src/prompts.py
+
+Two clear prompts:
+
+REVIEW_PROMPT → per-review concise summary (JSON envelope used only to extract summary text).
+
+PRODUCT_PROMPT → single-paragraph product narrative from concatenated summaries.
+
+Interviewer hook: “Why not use LLM for sentiment?” → We separated concerns: LLMs paraphrase well; ML model gives stable labels and predictable cost.
+
+src/ml_sentiment.py
+
+Transformers pipeline (distilbert-sst2) for sentiment; maps low confidence to neutral.
+
+Returns (label, score) so the aggregator can break ties by avg confidence.
+
+Interviewer hook: “Why SST-2?” → Lightweight, robust baseline; easy to swap with domain-specific models.
+
+src/llm_client.py
+
+Provider-agnostic HTTP client with caching + exponential backoff retries.
+
+Two entry points:
+
+complete_json() for JSON-ish outputs; failsafe JSON extraction block.
+
+complete_text() for free-form paragraph outputs.
+
+Interviewer hook: “Why manual HTTP vs SDK?” → Keeps dependencies minimal; but trivial to swap to official SDKs.
+
+src/llm_enrich.py
+
+Mixed approach per review:
+
+LLM → summary
+
+ML → sentiment, sentiment_score
+
+Batch iteration helper, builds silver_llm_outputs deterministically (replace mode).
+
+Interviewer hook: “Why batch but not async?” → Simpler control; rate-limit handled inside client; can move to task-queue/Airflow parallelism later.
+
+src/aggregate.py
+
+Product-level metrics:
+
+tmp_avg: average rating from bronze.
+
+tmp_sent: majority vote on sentiment with tiebreak by avg score.
+
+tmp_concat: up to 30 random summaries per product (bounded token cost).
+
+Prepares final gold_product_summary skeleton for narratives.
+
+Interviewer hook: “Why 30 reviews?” → Empirically balances signal & token spend; configurable.
+
+src/orchestration.py
+
+Calls PRODUCT_PROMPT on the joined summaries per product to generate the narrative paragraph.
+
+Writes the final gold table with avg_rating, sentiment, narrative_summary.
+
+Interviewer hook: “Why summaries of summaries?” → Two-stage reduces tokens dramatically vs dumping raw reviews.
+
+src/persist.py
+
+Exports gold to Parquet + CSV for BI tools or quick inspection.
+
+Interviewer hook: “Where would this go in prod?” → Data lake / warehouse bucket and then exposed to dashboards.
+
+dags/llm_reviews_dag.py
+
+Airflow DAG mirrors the logical flow: ingest → preprocess → enrich → aggregate → narrate → export.
+
+Easy to add retries, SLAs, and sensors; DAG is idempotent due to replace mode writes.
+
+Interviewer hook: “Where are alerts?” → Add EmailOperator/Slack, or push metrics to your observability stack.
+
+Flow diagram (say this, no slide required)
+
+Ingest (CSV → Parquet/bronze)
+
+Preprocess (dedupe/sample → silver)
+
+Enrich (LLM summary + ML sentiment → silver outputs)
+
+Aggregate (avg rating + majority sentiment + summary blob)
+
+Narrate (LLM product paragraph) → gold table
+
+Persist (CSV/Parquet exports)
+
+Design trade-offs (quick rationale)
+
+LLM vs ML for sentiment: LLM is flexible but costly/variable; ML is cheap/consistent. We use both where they shine.
+
+DuckDB: Zero-ops and fast locally; trivially replaceable later.
+
+Replace-mode writes: Ensures idempotency for reruns and clean demos.
+
+Caching & rate limiting: Bounds spend and API failures.
+
+Ops & quality talking points
+
+Resilience: Tenacity retries; JSON extraction fallback; dedupe prevents duplicate charges.
+
+Cost controls: Sampling, review cap per product (30), caching, small prompts.
+
+Data quality: Required columns validated; type coercion with safe drops; helpfulness metrics computed.
+
+Scalability roadmap:
+
+Parallelize llm_enrich in Airflow (task concurrency).
+
+Switch I/O to S3 + warehouse; cluster reviews via embeddings before summarization.
+
+Add Redis cache and request batching.
+
+“Gotcha” questions (and crisp answers)
+
+Q: Why majority vote for sentiment?
+A: Simple, robust aggregation; tie-break by mean confidence to avoid random ties.
+
+Q: Why join summaries instead of raw reviews for product paragraph?
+A: Cuts tokens 10–50×, reduces noise, keeps themes salient.
+
+Q: How do you test this?
+A: Unit tests around ingestion mappings, schema, and aggregator logic; golden samples for ml_sentiment.classify.
+
+Q: PII or toxic content?
+A: In prod, add a moderation/PII scrubber before LLM calls; trivial to add a pre-filter step.
+
+Live demo script (3–5 minutes)
+
+Show data present
+ls data/raw/amazon_product_reviews.csv
+
+Activate venv + env
+source .venv/bin/activate (or Windows equivalent)
+export PYTHONPATH="$(pwd)"
+
+Run steps
+
+python -c "from src import ingest_kaggle; print(ingest_kaggle.run('amazon_product_reviews.csv'))"
+python -c "from src import preprocess; preprocess.run(0.2)"  # sampling for speed
+python -c "from src import llm_enrich; llm_enrich.run(limit=200)"
+python -c "from src import aggregate; aggregate.run()"
+python -c "from src import orchestration; orchestration.build_product_paragraphs()"
+python -c "from src import persist; persist.export_gold()"
+
+
+Inspect results (choose one)
+
+CLI: duckdb data/warehouse.duckdb → SELECT * FROM gold_product_summary LIMIT 5;
+
+CSV: open data/gold/product_summary.csv
+
+Close with metrics
+Mention #reviews processed, #products summarized, avg tokens per step.
+
+Troubleshooting one-liners
+
+Module not found: export PYTHONPATH="$(pwd)"
+
+No run attribute: Ensure src/__init__.py exists and function is top-level.
+
+Torch install issues (Mac M-series/Windows): pin CPU wheel or use pip install torch==2.3.1+cpu -f https://download.pytorch.org/whl/cpu.
+
+Empty outputs: Check column names match EXPECTED_COLS and that review_text isn’t empty after cleaning.
+
+1. Narrative Product Review Summary
+
+Where it’s done:
+
+src/orchestration.py → build_product_paragraphs()
+
+Uses PRODUCT_PROMPT to synthesize a single paragraph per product.
+
+Input = joined per-review summaries (from tmp_concat).
+
+Output = gold_product_summary.narrative_summary.
+
+2. Average Product Rating Score
+
+Where it’s done:
+
+src/aggregate.py (CTE tmp_avg)
+
+CREATE OR REPLACE TABLE tmp_avg AS
+SELECT product_id, AVG(rating) AS avg_rating
+FROM bronze_reviews
+GROUP BY 1;
+
+
+Propagated to the final gold_product_summary.avg_rating.
+
+3. Product Review Sentiment Analysis
+
+Where it’s done:
+
+Per review:
+
+src/llm_enrich.py → calls ml_sentiment.classify() (Transformer) to label each review.
+
+Per product:
+
+src/aggregate.py → tmp_sent majority-votes review sentiments, tie-breaking by average confidence.
+
+Result stored as gold_product_summary.sentiment.

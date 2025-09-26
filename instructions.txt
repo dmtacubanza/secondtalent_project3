@@ -1,0 +1,128 @@
+0) Prereqs
+
+Python 3.9+
+
+(Optional) Docker (for Airflow)
+
+Kaggle CSV saved as: data/raw/amazon_product_reviews.csv
+
+1) Set up the environment
+# from repo root
+python -m venv .venv
+# macOS/Linux
+source .venv/bin/activate
+# Windows PowerShell
+# .venv\Scripts\Activate.ps1
+
+pip install -r requirements.txt
+# add ML sentiment deps if not already in requirements
+pip install "transformers>=4.40.0" torch --upgrade
+
+
+Create a .env (used by src/config.py via dotenv):
+
+# minimal .env example
+echo 'LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-REPLACE_ME
+OPENAI_MODEL=gpt-4o-mini
+CACHE_DIR=.cache
+DUCKDB_PATH=./data/warehouse.duckdb' > .env
+
+
+If you prefer Gemini or Hugging Face, set LLM_PROVIDER=gemini (and GEMINI_API_KEY) or LLM_PROVIDER=hf (and HF_API_KEY).
+
+Make sure Python can import src/:
+
+# macOS/Linux
+export PYTHONPATH="$(pwd)"
+# Windows PowerShell
+# $env:PYTHONPATH = (Get-Location).Path
+
+2) Put the dataset in place
+
+Download the Kaggle file and put it here:
+
+data/raw/amazon_product_reviews.csv
+
+3) Run the pipeline (step-by-step)
+
+These are exactly the modules in your canvas.
+
+# 1) Ingest → cleans & maps columns, writes DuckDB table bronze_reviews
+python -c "from src import ingest_kaggle; print(ingest_kaggle.run('amazon_product_reviews.csv'))"
+
+# 2) Preprocess → dedupe & (optionally) sample into silver_reviews
+python -c "from src import preprocess; preprocess.run(0.2)"   # use 0.2 for a cheap test, or None
+
+# 3) Enrich → LLM summary + ML sentiment into silver_llm_outputs
+python -c "from src import llm_enrich; llm_enrich.run(limit=200)"  # limit for quick test
+
+# 4) Aggregate → avg rating + majority sentiment + concat summaries
+python -c "from src import aggregate; aggregate.run()"
+
+# 5) Narrate → product-level paragraph using PRODUCT_PROMPT
+python -c "from src import orchestration; orchestration.build_product_paragraphs()"
+
+# 6) Export → save CSV/Parquet for easy viewing
+python -c "from src import persist; persist.export_gold()"
+
+4) Verify results (fast tests)
+A. Files should exist
+data/processed/clean_reviews.csv
+data/gold/product_summary.csv
+data/gold/product_summary.parquet
+data/warehouse.duckdb
+
+B. Peek into DuckDB
+# macOS/Linux
+duckdb data/warehouse.duckdb
+-- then in the DuckDB shell:
+.tables
+SELECT COUNT(*) FROM bronze_reviews;
+SELECT COUNT(*) FROM silver_reviews;
+SELECT COUNT(*) FROM silver_llm_outputs;
+SELECT * FROM gold_product_summary LIMIT 5;
+
+C. Quick programmatic checks
+python - << 'PY'
+import duckdb
+con = duckdb.connect("data/warehouse.duckdb")
+print("bronze:", con.execute("select count(*) from bronze_reviews").fetchone()[0])
+print("silver:", con.execute("select count(*) from silver_reviews").fetchone()[0])
+print("enriched:", con.execute("select count(*) from silver_llm_outputs").fetchone()[0])
+print(con.execute("select * from gold_product_summary limit 3").df())
+PY
+
+5) Common troubleshooting
+
+Module not found / no run attribute
+Ensure src/__init__.py exists and PYTHONPATH is set to repo root (see step 1).
+
+Torch install issues
+Use a CPU wheel if needed (example):
+pip install torch==2.3.1+cpu -f https://download.pytorch.org/whl/cpu
+
+LLM auth errors
+Make sure your .env has the correct key and LLM_PROVIDER matches.
+
+Empty outputs
+Confirm the Kaggle columns match exactly (we validate in ingest_kaggle.py).
+Also check that review_text isn’t blank after cleaning.
+
+6) (Optional) Run with Airflow + Docker
+docker compose up
+
+
+Open Airflow at http://localhost:8080
+ and trigger the llm_reviews DAG.
+This runs the same steps in order: ingest → preprocess → enrich → aggregate → narrate → export.
+
+7) What to show in an interview (quick checks)
+
+wc -l data/processed/clean_reviews.csv (rows after cleaning)
+
+SELECT COUNT(DISTINCT product_id) FROM bronze_reviews;
+
+SELECT product_id, avg_rating, sentiment, left(narrative_summary, 120)||'...' AS preview FROM gold_product_summary LIMIT 5;
+
+Open data/gold/product_summary.csv and show one full narrative paragraph.

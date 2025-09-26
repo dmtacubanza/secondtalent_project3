@@ -1,0 +1,14 @@
+python-dotenv
+pydantic
+pandas
+pyarrow
+duckdb
+httpx
+tenacity
+rapidfuzz
+tqdm
+transformers
+torch
+nltk
+sumy
+matplotlib
